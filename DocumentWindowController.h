@@ -1,7 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import "ScalingScrollView.h"
 
-@interface DocumentWindowController : NSWindowController {
+@interface DocumentWindowController : NSWindowController <NSLayoutManagerDelegate, NSTextViewDelegate> {
     IBOutlet ScalingScrollView *scrollView;
     NSLayoutManager *layoutMgr;
     BOOL hasMultiplePages;
@@ -19,5 +19,7 @@
 - (NSView *)documentView;
 
 - (void)breakUndoCoalescing;
+
+- (IBAction)chooseAndAttachFiles:(id)sender;
 
 @end

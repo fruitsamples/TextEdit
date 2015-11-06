@@ -1,6 +1,6 @@
 /*
         DocumentPropertiesPanelController.m
-        Copyright (c) 2007 by Apple Computer, Inc., all rights reserved.
+        Copyright (c) 2007-2009 by Apple Computer, Inc., all rights reserved.
         Author: Ali Ozer
 
         "Document Properties" panel controller for TextEdit.  There is a little more code here than one would like,
@@ -48,7 +48,7 @@
 #import "DocumentPropertiesPanelController.h"
 #import "Document.h"
 #import "DocumentController.h"
-
+#import "TextEditMisc.h"
 
 @implementation DocumentPropertiesPanelController
 
@@ -111,7 +111,7 @@
 
 /* Since we want the panel to toggle... Note that if the window is visible and key, we order it out; otherwise we make it key.
 */
-- (void)toggleWindow:(id)sender {
+- (IBAction)toggleWindow:(id)sender {
     NSWindow *window = [self window];
     if ([window isVisible] && [window isKeyWindow]) {
 	[[self window] orderOut:sender];

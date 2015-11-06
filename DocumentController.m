@@ -1,6 +1,6 @@
 /*
         Document.m
-        Copyright (c) 1995-2007 by Apple Computer, Inc., all rights reserved.
+        Copyright (c) 1995-2009 by Apple Computer, Inc., all rights reserved.
         Author: David Remahl
  
         NSDocumentController subclass for TextEdit
@@ -42,7 +42,7 @@
 #import "DocumentController.h"
 #import "Document.h"
 #import "EncodingManager.h"
-#import "Preferences.h"
+#import "TextEditDefaultsKeys.h"
 #import "TextEditErrors.h"
 
 /* A very simple container class which is used to collect the outlets from loading the encoding accessory.  No implementation provided, because all of the references are weak and don't need retain/release.  Would be nice to be able to switch to a mutable dictionary here at some point.
@@ -50,7 +50,7 @@
 @interface OpenSaveAccessoryOwner : NSObject {
 @public
     IBOutlet NSView *accessoryView;
-    IBOutlet EncodingPopUpButton *encodingPopUp;
+    IBOutlet NSPopUpButton *encodingPopUp;
     IBOutlet NSButton *checkBox;
 }
 @end
@@ -60,53 +60,78 @@
 
 @implementation DocumentController
 
+- (void)awakeFromNib {
+    [self bind:@"autosavingDelay" toObject:[NSUserDefaultsController sharedUserDefaultsController] withKeyPath:@"values." AutosaveDelay options:nil];
+    customOpenSettings = [[NSMutableDictionary alloc] init];
+    transientDocumentLock = [[NSLock alloc] init];
+    displayDocumentLock = [[NSLock alloc] init];
+}
+
+- (void)dealloc {
+    [self unbind:@"autosavingDelay"];
+    [customOpenSettings release];
+    [transientDocumentLock release];
+    [displayDocumentLock release];
+    [super dealloc];
+}
+
 /* Create a new document of the default type and initialize its contents from the pasteboard. 
 */
 - (Document *)openDocumentWithContentsOfPasteboard:(NSPasteboard *)pb display:(BOOL)display error:(NSError **)error {
-    BOOL result = NO;
+    // Read type and attributed string.
+    NSString *pasteboardType = [pb availableTypeFromArray:[NSAttributedString readableTypesForPasteboard:pb]];
+    NSData *data = [pb dataForType:pasteboardType];
+    NSAttributedString *string = nil;
     NSString *type = nil;
-    NSMutableArray *availableTypes = [NSMutableArray arrayWithArray:[pb types]];
-    NSTextView *textView = [[[NSTextView alloc] initWithFrame:NSMakeRect(0., 0., CGFLOAT_MAX, CGFLOAT_MAX)] autorelease];   // Temporary
+
+    if (data != nil) {
+        NSDictionary *attributes = nil;
+        string = [[[NSAttributedString alloc] initWithData:data options:nil documentAttributes:&attributes error:error] autorelease];
     
-    // Look for a type to read; we do this ourselves so that we know exactly which type is read
-    while (!result && [availableTypes count] > 0 && (type = [textView preferredPasteboardTypeFromArray:availableTypes restrictedToTypesFromArray:nil])) {
-        result = [textView readSelectionFromPasteboard:pb type:type];
-        [availableTypes removeObject:type];
+        // We only expect to see plain-text, RTF, and RTFD at this point.
+        NSString *docType = [attributes objectForKey:NSDocumentTypeDocumentAttribute];
+        if ([docType isEqualToString:NSPlainTextDocumentType]) {
+            type = (NSString *)kUTTypePlainText;
+        } else if ([docType isEqualToString:NSRTFTextDocumentType]) {
+            type = (NSString *)kUTTypeRTF;
+        } else if ([docType isEqualToString:NSRTFDTextDocumentType]) {
+            type = (NSString *)kUTTypeRTFD;
+        }
     }
-
-    if (result && type) {
-	Document *transientDoc = [self transientDocumentToReplace];
-
+    
+    if (string != nil && type != nil) {
 	Class docClass = [self documentClassForType:type];
-	if (!docClass) {    // Could happen if the type is unknown to TextEdit as a possible doc format but is importable into text (for instance, URL)
-	    type = [[textView textStorage] containsAttachments] ? NSRTFDPboardType : NSRTFPboardType;
-	    docClass = [self documentClassForType:type];
-	}
-	id doc = [[[docClass alloc] initWithType:type error:error] autorelease];
-	if (!doc) return nil; // error has been set
-	
-	[[doc textStorage] replaceCharactersInRange:NSMakeRange(0, [[doc textStorage] length]) withAttributedString:[textView textStorage]];
-	
-	if ([type isEqualToString:NSStringPboardType]) {
-	    [[doc textStorage] setAttributes:[doc defaultTextAttributes:NO] range:NSMakeRange(0, [[textView textStorage] length])];
-	}
-	
-	[self addDocument:doc];
-	
-	if (transientDoc != nil) {
-	    [self replaceTransientDocument:transientDoc withDocument:doc display:display];
-	} else {
-	    if (display) {
-		[doc makeWindowControllers];
-		[doc showWindows];
-	    }
-	}
-	
-	return doc;
+        
+        if (docClass != nil) {
+            Document *transientDoc = nil;
+            
+            [transientDocumentLock lock];
+            transientDoc = [self transientDocumentToReplace];
+            if (transientDoc) {
+                // If this document has claimed the transient document, cause -transientDocumentToReplace to return nil for all other documents.
+                [transientDoc setTransient:NO];
+            }
+            [transientDocumentLock unlock];
+            
+            id doc = [[[docClass alloc] initWithType:type error:error] autorelease];
+            if (!doc) return nil; // error has been set
+            
+            NSTextStorage *text = [doc textStorage];
+            [text replaceCharactersInRange:NSMakeRange(0, [text length]) withAttributedString:string];
+            if ([[NSWorkspace sharedWorkspace] type:type conformsToType:(NSString *)kUTTypePlainText]) [doc applyDefaultTextAttributes:NO];
+            
+            [self addDocument:doc];
+            [doc updateChangeCount:NSChangeReadOtherContents];
+            
+            if (transientDoc) [self replaceTransientDocument:[NSArray arrayWithObjects:transientDoc, doc, nil]];
+            if (display) [self displayDocument:doc];
+            
+            return doc;
+        }
     }
     
-    // No suitable type found on pasteboard
-    if (error) *error = [NSError errorWithDomain:TextEditErrorDomain code:TextEditOpenDocumentWithSelectionServiceFailed userInfo:[
+    // Either we could not read data from pasteboard, or the data was interpreted with a type we don't understand.
+    if ((data == nil || (string != nil && type == nil)) && error) *error = [NSError errorWithDomain:TextEditErrorDomain code:TextEditOpenDocumentWithSelectionServiceFailed userInfo:[
             NSDictionary dictionaryWithObjectsAndKeys:NSLocalizedString(@"Service failed. Couldn\\U2019t open the selection.", @"Title of alert indicating error during 'New Window Containing Selection' service"), NSLocalizedDescriptionKey,
             NSLocalizedString(@"There might be an internal error or a performance problem, or the source application may be providing text of invalid type in the service request. Please try the operation a second time. If that doesn\\U2019t work, copy/paste the selection into TextEdit.", @"Recommendation when 'New Window Containing Selection' service fails"), NSLocalizedRecoverySuggestionErrorKey,
             nil]];
@@ -141,37 +166,92 @@
     return ([documents count] == 1 && [(transientDoc = [documents objectAtIndex:0]) isTransientAndCanBeReplaced]) ? transientDoc : nil;
 }
 
-- (void)replaceTransientDocument:(Document *)transientDoc withDocument:(Document *)doc display:(BOOL)displayDocument {
-    NSArray *controllersToTransfer = [[transientDoc windowControllers] copy];
-    NSEnumerator *controllerEnum = [controllersToTransfer objectEnumerator];
-    NSWindowController *controller;
-    
-    [controllersToTransfer makeObjectsPerformSelector:@selector(retain)];
-    
-    while (controller = [controllerEnum nextObject]) {
-	[doc addWindowController:controller];
-	[transientDoc removeWindowController:controller];
-    }
-    [transientDoc close];
-    
-    [controllersToTransfer makeObjectsPerformSelector:@selector(release)];
-    [controllersToTransfer release];
-    
-    if (displayDocument) {
-	[doc makeWindowControllers];
-	[doc showWindows];
+- (void)displayDocument:(NSDocument *)doc {
+    // Documents must be displayed on the main thread.
+    if ([NSThread isMainThread]) {
+        [doc makeWindowControllers];
+        [doc showWindows];
+    } else {
+        [self performSelectorOnMainThread:_cmd withObject:doc waitUntilDone:YES];
     }
 }
 
-/* When a document is opened, check to see whether there is a document that is already open, and whether it is transient. If so, transfer the document's window controllers and close the transient document. 
+- (void)replaceTransientDocument:(NSArray *)documents {
+    // Transient document must be replaced on the main thread, since it may undergo automatic display on the main thread.
+    if ([NSThread isMainThread]) {
+        NSDocument *transientDoc = [documents objectAtIndex:0], *doc = [documents objectAtIndex:1];
+        NSArray *controllersToTransfer = [[transientDoc windowControllers] copy];
+        NSEnumerator *controllerEnum = [controllersToTransfer objectEnumerator];
+        NSWindowController *controller;
+        
+        [controllersToTransfer makeObjectsPerformSelector:@selector(retain)];
+        
+        while (controller = [controllerEnum nextObject]) {
+            [doc addWindowController:controller];
+            [transientDoc removeWindowController:controller];
+        }
+        [transientDoc close];
+        
+        [controllersToTransfer makeObjectsPerformSelector:@selector(release)];
+        [controllersToTransfer release];
+	
+	// We replaced the value of the transient document with opened document, need to notify accessibility clients.
+	for (NSLayoutManager *layoutManager in [[(Document *)doc textStorage] layoutManagers]) {
+	    for (NSTextContainer *textContainer in [layoutManager textContainers]) {
+		NSTextView *textView = [textContainer textView];
+		if (textView) NSAccessibilityPostNotification(textView, NSAccessibilityValueChangedNotification);
+	    }
+	}
+	
+    } else {
+        [self performSelectorOnMainThread:_cmd withObject:documents waitUntilDone:YES];
+    }
+}
+
+/* When a document is opened, check to see whether there is a document that is already open, and whether it is transient. If so, transfer the document's window controllers and close the transient document. When +[Document canConcurrentlyReadDocumentsOfType:] return YES, this method may be invoked on multiple threads. Ensure that only one document replaces the transient document. The transient document must be replaced before any other documents are displayed for window cascading to work correctly. To guarantee this, defer all display operations until the transient document has been replaced.
 */
 - (id)openDocumentWithContentsOfURL:(NSURL *)absoluteURL display:(BOOL)displayDocument error:(NSError **)outError {
-    Document *transientDoc = [self transientDocumentToReplace];
-    Document *doc = [super openDocumentWithContentsOfURL:absoluteURL display:(displayDocument && !transientDoc) error:outError];
+    Document *transientDoc = nil;
     
-    if (!doc) return nil;
+    [transientDocumentLock lock];
+    transientDoc = [self transientDocumentToReplace];
+    if (transientDoc) {
+        // Once this document has claimed the transient document, cause -transientDocumentToReplace to return nil for all other documents.
+        [transientDoc setTransient:NO];
+        deferredDocuments = [[NSMutableArray alloc] init];
+    }
+    [transientDocumentLock unlock];
     
-    if (transientDoc != nil) [self replaceTransientDocument:transientDoc withDocument:doc display:YES];
+    // Don't make NSDocumentController display the NSDocument it creates. Instead, do it later manually to ensure that the transient document has been replaced first.
+    Document *doc = [super openDocumentWithContentsOfURL:absoluteURL display:NO error:outError];
+    
+    [customOpenSettings removeObjectForKey:absoluteURL];
+    
+    if (transientDoc) {
+        if (doc) {
+            [self replaceTransientDocument:[NSArray arrayWithObjects:transientDoc, doc, nil]];
+            if (displayDocument) [self displayDocument:doc];
+        }
+        
+        // Now that the transient document has been replaced, display all deferred documents.
+        [displayDocumentLock lock];
+        NSArray *documentsToDisplay = deferredDocuments;
+        deferredDocuments = nil;
+        [displayDocumentLock unlock];
+        for (NSDocument *document in documentsToDisplay) [self displayDocument:document];
+        [documentsToDisplay release];
+    } else if (doc && displayDocument) {
+        [displayDocumentLock lock];
+        if (deferredDocuments) {
+            // Defer displaying this document, because the transient document has not yet been replaced.
+            [deferredDocuments addObject:doc];
+            [displayDocumentLock unlock];
+        } else {
+            // The transient document has been replaced, so display the document immediately.
+            [displayDocumentLock unlock];
+            [self displayDocument:doc];
+        }
+    }
     
     return doc;
 }
@@ -189,7 +269,7 @@
 
 /* Loads the "encoding" accessory view used in save plain and open panels. There is a checkbox in the accessory which has different purposes in each case; so we let the caller set the title and other info for that checkbox.
 */
-+ (NSView *)encodingAccessory:(NSUInteger)encoding includeDefaultEntry:(BOOL)includeDefaultItem encodingPopUp:(NSPopUpButton **)popup checkBox:(NSButton **)button {
++ (NSView *)encodingAccessory:(NSStringEncoding)encoding includeDefaultEntry:(BOOL)includeDefaultItem encodingPopUp:(NSPopUpButton **)popup checkBox:(NSButton **)button {
     OpenSaveAccessoryOwner *owner = [[[OpenSaveAccessoryOwner alloc] init] autorelease];
     // Rather than caching, load the accessory view everytime, as it might appear in multiple panels simultaneously.
     if (![NSBundle loadNibNamed:@"EncodingAccessory" owner:owner])  {
@@ -198,72 +278,66 @@
     }
     if (popup) *popup = owner->encodingPopUp;
     if (button) *button = owner->checkBox;
-    [[EncodingManager sharedInstance] setupPopUp:owner->encodingPopUp selectedEncoding:encoding withDefaultEntry:includeDefaultItem];
+    [[EncodingManager sharedInstance] setupPopUpCell:[owner->encodingPopUp cell] selectedEncoding:encoding withDefaultEntry:includeDefaultItem];
     return [owner->accessoryView autorelease];
-}
-
-- (IBAction)openDocument:(id)sender {
-    // Remember the current default settings
-    lastSelectedEncoding = [self lastSelectedEncoding];
-    lastSelectedIgnoreHTML = [self lastSelectedIgnoreHTML];
-    lastSelectedIgnoreRich = [self lastSelectedIgnoreRich];
-
-    // Now switch to using those explicitly
-    useCustomSettingsForOptions = YES;
-    
-    // Let the user choose document, and change settings
-    [super openDocument:sender];
-
-    // All done; switch back to using the default values
-    useCustomSettingsForOptions = NO;    
 }
 
 /* To support selection of a fallback encoding, we override this method and add an accessory view.
 */
-- (NSInteger)runModalOpenPanel:(NSOpenPanel *)openPanel forTypes:(NSArray *)fileNameExtensionsAndHFSFileTypes {
+- (NSInteger)runModalOpenPanel:(NSOpenPanel *)openPanel forTypes:(NSArray *)types {
     NSButton *ignoreRichTextButton;
     NSPopUpButton *encodingPopUp;
+    NSUInteger encoding;
+    BOOL ignoreHTML = [[NSUserDefaults standardUserDefaults] boolForKey:IgnoreHTML];
+    BOOL ignoreRich = [[NSUserDefaults standardUserDefaults] boolForKey:IgnoreRichText];
     NSInteger result;
     
-    [openPanel setAccessoryView:[[self class] encodingAccessory:[[Preferences objectForKey:PlainTextEncodingForRead] unsignedIntegerValue] includeDefaultEntry:YES encodingPopUp:&encodingPopUp checkBox:&ignoreRichTextButton]];
+    [openPanel setAccessoryView:[[self class] encodingAccessory:[[[NSUserDefaults standardUserDefaults] objectForKey:PlainTextEncodingForRead] unsignedIntegerValue] includeDefaultEntry:YES encodingPopUp:&encodingPopUp checkBox:&ignoreRichTextButton]];
     [ignoreRichTextButton setTitle:NSLocalizedString(@"Ignore rich text commands", @"Checkbox indicating that when opening a rich text file, the rich text should be ignored (causing the file to be loaded as plain text)")];
-    // Also set tooltip: "If selected, HTML and RTF files will be loaded as plain text, allowing you to see and edit the HTML or RTF directives". If the ignoreRichText and ignoreHTML preference values do not agree, then the initial state of the ignore button in the panel should be "mixed" state, indicating it will do the appropriate thing depending on the file selected.
-    if (lastSelectedIgnoreRich != lastSelectedIgnoreHTML) {
+    [ignoreRichTextButton setToolTip:NSLocalizedString(@"If selected, HTML and RTF files will be loaded as plain text, allowing you to see and edit the HTML or RTF directives.", @"Tooltip for checkbox indicating that when opening a rich text file, the rich text should be ignored (causing the file to be loaded as plain text)")];
+    if (ignoreRich != ignoreHTML) {
 	[ignoreRichTextButton setAllowsMixedState:YES];
 	[ignoreRichTextButton setState:NSMixedState];
     } else {
 	if ([ignoreRichTextButton allowsMixedState]) [ignoreRichTextButton setAllowsMixedState:NO];
-	[ignoreRichTextButton setState:lastSelectedIgnoreRich ? NSOnState : NSOffState];
+	[ignoreRichTextButton setState:ignoreRich ? NSOnState : NSOffState];
     }
     
-    result = [super runModalOpenPanel:openPanel forTypes:fileNameExtensionsAndHFSFileTypes];
+    result = [super runModalOpenPanel:openPanel forTypes:types];
     if (result == NSOKButton) {
-	lastSelectedEncoding = [[encodingPopUp selectedItem] tag];
+	encoding = (NSStringEncoding)[[[encodingPopUp selectedItem] representedObject] unsignedIntegerValue];
 	NSInteger ignoreState = [ignoreRichTextButton state];
 	if (ignoreState != NSMixedState) {  // Mixed state indicates they were different, and to leave them alone
-	    lastSelectedIgnoreHTML = lastSelectedIgnoreRich = (ignoreState == NSOnState);
+	    ignoreHTML = ignoreRich = (ignoreState == NSOnState);
 	}
+        NSDictionary *options = [NSDictionary dictionaryWithObjectsAndKeys:[NSNumber numberWithUnsignedInteger:encoding], PlainTextEncodingForRead, [NSNumber numberWithBool:ignoreHTML], IgnoreHTML, [NSNumber numberWithBool:ignoreRich], IgnoreRichText, nil];
+        for (NSURL *url in [openPanel URLs]) {
+            [customOpenSettings setObject:options forKey:url];
+        }
     }
     return result;
 }
 
-- (NSStringEncoding)lastSelectedEncoding {
-    return useCustomSettingsForOptions ? lastSelectedEncoding : [[Preferences objectForKey:PlainTextEncodingForRead] unsignedIntegerValue];
+- (NSStringEncoding)lastSelectedEncodingForURL:(NSURL *)url {
+    NSDictionary *options = [customOpenSettings objectForKey:url];
+    return options ? [[options objectForKey:PlainTextEncodingForRead] unsignedIntegerValue] : [[[NSUserDefaults standardUserDefaults] objectForKey:PlainTextEncodingForRead] unsignedIntegerValue];
 }
 
-- (BOOL)lastSelectedIgnoreHTML {
-    return useCustomSettingsForOptions ? lastSelectedIgnoreHTML : [[Preferences objectForKey:IgnoreHTML] boolValue];
+- (BOOL)lastSelectedIgnoreHTMLForURL:(NSURL *)url {
+    NSDictionary *options = [customOpenSettings objectForKey:url];
+    return options ? [[options objectForKey:IgnoreHTML] unsignedIntegerValue] : [[NSUserDefaults standardUserDefaults] boolForKey:IgnoreHTML];;
 }
 
-- (BOOL)lastSelectedIgnoreRich {
-    return useCustomSettingsForOptions ? lastSelectedIgnoreRich : [[Preferences objectForKey:IgnoreRichText] boolValue];
+- (BOOL)lastSelectedIgnoreRichForURL:(NSURL *)url {
+    NSDictionary *options = [customOpenSettings objectForKey:url];
+    return options ? [[options objectForKey:IgnoreRichText] unsignedIntegerValue] : [[NSUserDefaults standardUserDefaults] boolForKey:IgnoreRichText];
 }
 
 /* The user can change the default document type between Rich and Plain in Preferences. We override
    -defaultType to return the appropriate type string. 
 */
 - (NSString *)defaultType {
-    return [[Preferences objectForKey:RichText] boolValue] ? NSRTFPboardType : NSStringPboardType;
+    return (NSString *)([[NSUserDefaults standardUserDefaults] boolForKey:RichText] ? kUTTypeRTF : kUTTypePlainText);
 }
 
 @end

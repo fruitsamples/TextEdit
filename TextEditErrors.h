@@ -7,10 +7,10 @@ enum {
     TextEditSaveErrorLossyDocument = 2,
     TextEditSaveErrorRTFDRequired = 3, 
     TextEditSaveErrorEncodingInapplicable = 4,
-    TextEditSaveErrorCouldNotCreateDocument = 5,
     TextEditOpenDocumentWithSelectionServiceFailed = 100,
     TextEditInvalidLineSpecification = 200,
-    TextEditOutOfRangeLineSpecification = 201
+    TextEditOutOfRangeLineSpecification = 201,
+    TextEditAttachFilesFailure = 300
 };
 
 

@@ -1,6 +1,6 @@
 /*
         DocumentWindowController.m
-        Copyright (c) 1995-2007 by Apple Computer, Inc., all rights reserved.
+        Copyright (c) 1995-2009 by Apple Computer, Inc., all rights reserved.
         Author: David Remahl, adapted from old Document.m
  
         Document's main window controller object for TextEdit
@@ -41,7 +41,9 @@
 #import "DocumentWindowController.h"
 #import "Document.h"
 #import "MultiplePageView.h"
-#import "Preferences.h"
+#import "TextEditDefaultsKeys.h"
+#import "TextEditMisc.h"
+#import "TextEditErrors.h"
 
 @interface DocumentWindowController(Private)
 
@@ -96,8 +98,7 @@
 /* This method can be called in three different situations (number three is a special TextEdit case):
 	1) When the window controller is created and set up with a new or opened document. (!oldDoc && doc)
 	2) When the document is closed, and the controller is about to be destroyed (oldDoc && !doc)
-	3) When the window controller is assigned to another document (a document has been opened
-	    and it takes the place of an automatically-created window). (oldDoc && doc)
+	3) When the window controller is assigned to another document (a document has been opened and it takes the place of an automatically-created window).  In that case this method is called twice.  First as #2 above, second as #1.
 
    The window can be visible or hidden at the time of the message.
 */
@@ -165,11 +166,22 @@
     [textView setDelegate:self];
     [textView setAllowsUndo:YES];
     [textView setAllowsDocumentBackgroundColorChange:YES];
-    [textView setContinuousSpellCheckingEnabled:[[Preferences objectForKey:CheckSpellingAsYouType] boolValue]];
-    [textView setGrammarCheckingEnabled:[[Preferences objectForKey:CheckGrammarWithSpelling] boolValue]];
-    [textView setSmartInsertDeleteEnabled:[[Preferences objectForKey:SmartCopyPaste] boolValue]];
-    [textView setAutomaticQuoteSubstitutionEnabled:[[Preferences objectForKey:SmartQuotes] boolValue]];
-    [textView setAutomaticLinkDetectionEnabled:[[Preferences objectForKey:SmartLinks] boolValue]];
+    
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    
+    // Some settings are not enabled for plain text docs if the default "SubstitutionsEnabledInRichTextOnly" is set to YES.
+    // There is no UI at this stage for this preference.
+    BOOL substitutionsOK = [[self document] isRichText] || ![defaults boolForKey:SubstitutionsEnabledInRichTextOnly];    
+    [textView setContinuousSpellCheckingEnabled:[defaults boolForKey:CheckSpellingAsYouType]];
+    [textView setGrammarCheckingEnabled:[defaults boolForKey:CheckGrammarWithSpelling]];
+    [textView setAutomaticSpellingCorrectionEnabled:substitutionsOK && [defaults boolForKey:CorrectSpellingAutomatically]];
+    [textView setSmartInsertDeleteEnabled:[defaults boolForKey:SmartCopyPaste]];
+    [textView setAutomaticQuoteSubstitutionEnabled:substitutionsOK && [defaults boolForKey:SmartQuotes]];
+    [textView setAutomaticDashSubstitutionEnabled:substitutionsOK && [defaults boolForKey:SmartDashes]];
+    [textView setAutomaticLinkDetectionEnabled:[defaults boolForKey:SmartLinks]];
+    [textView setAutomaticDataDetectionEnabled:[defaults boolForKey:DataDetectors]];
+    [textView setAutomaticTextReplacementEnabled:substitutionsOK && [defaults boolForKey:TextReplacement]];
+    
     [textView setSelectedRange:NSMakeRange(0, 0)];
 }
 
@@ -242,7 +254,7 @@
 
 - (void)showRuler:(id)obj {
     if (rulerIsBeingDisplayed && !obj) [self showRulerDelayed:NO];	// Cancel outstanding request, if not coming from the delayed request
-    if ([[Preferences objectForKey:ShowRuler] boolValue]) [[self firstTextView] setRulerVisible:YES];
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:ShowRuler]) [[self firstTextView] setRulerVisible:YES];
 }
 
 /* Used when converting to plain text
@@ -256,7 +268,7 @@
     while (loc < end) {	/* Run through the string in terms of attachment runs */
         NSRange attachmentRange;	/* Attachment attribute run */
         NSTextAttachment *attachment = [attrString attribute:NSAttachmentAttributeName atIndex:loc longestEffectiveRange:&attachmentRange inRange:NSMakeRange(loc, end-loc)];
-        if (attachment != nil) {	/* If there is an attachment, make sure it is valid */
+        if (attachment) {	/* If there is an attachment and it is on an attachment character, remove the character */
             unichar ch = [[attrString string] characterAtIndex:loc];
             if (ch == NSAttachmentCharacter) {
 		if ([view shouldChangeTextInRange:NSMakeRange(loc, 1) replacementString:@""]) {
@@ -271,6 +283,60 @@
     }
     [attrString endEditing];
 }
+
+/* This method implements panel-based "attach" functionality. Note that as-is, it's set to accept all files; however, by setting allowed types on the open panel it can be restricted to images, etc.
+*/
+- (void)chooseAndAttachFiles:(id)sender {
+    NSOpenPanel *panel = [NSOpenPanel openPanel];
+    [panel setCanChooseDirectories:YES];
+    [panel setAllowsMultipleSelection:YES];
+    // Use the 10.6-introduced sheet API with block handler
+    [panel beginSheetModalForWindow:[self window] completionHandler:^(NSInteger result) {
+	if (result == NSFileHandlingPanelOKButton) {	// Only if not cancelled
+            NSArray *urls = [panel URLs];
+	    NSTextView *textView = [self firstTextView];
+	    NSInteger numberOfErrors = 0;
+	    NSError *error = nil;
+	    NSMutableAttributedString *attachments = [[NSMutableAttributedString alloc] init];
+
+	    // Process all the attachments, creating an attributed string 
+	    for (NSURL *url in urls) {
+		NSFileWrapper *wrapper = [[NSFileWrapper alloc] initWithURL:url options:NSFileWrapperReadingImmediate error:&error];
+		if (wrapper) {
+		    NSTextAttachment *attachment = [[NSTextAttachment alloc] initWithFileWrapper:wrapper];
+		    [attachments appendAttributedString:[NSAttributedString attributedStringWithAttachment:attachment]];
+		    [wrapper release];
+		    [attachment release];
+		} else {
+		    numberOfErrors++;
+		}
+	    }
+	    
+	    // We could actually take an approach where on partial success we allow the user to cancel the operation, but since it's easy enough to undo, this seems reasonable enough
+	    if ([attachments length] > 0) {
+		NSRange selectionRange = [textView selectedRange];
+		if ([textView shouldChangeTextInRange:selectionRange replacementString:[attachments string]]) {  // Shouldn't fail, since we are controlling the text view; but if it does, we simply don't allow the change
+		    [[textView textStorage] replaceCharactersInRange:selectionRange withAttributedString:attachments];
+		    [textView didChangeText];
+		}
+	    }
+	    [attachments release];
+	    
+	    [panel orderOut:nil];   // Strictly speaking not necessary, but if we put up an error sheet, a good idea for the panel to be dismissed first
+
+	    // Deal with errors opening some or all of the attachments
+	    if (numberOfErrors > 0) {
+		if (numberOfErrors > 1) {  // More than one failure, put up a summary error (which doesn't do a good job of communicating the actual errors, but multiple attachments is a relatively rare case). For one error, we present the actual NSError we got back.
+		    // The error message will be different depending on whether all or some of the files were successfully attached.
+		    NSString *description = (numberOfErrors == [urls count]) ? NSLocalizedString(@"None of the items could be attached.", @"Title of alert indicating error during 'Attach Files...' when user tries to attach (insert) multiple files and none can be attached.") : NSLocalizedString(@"Some of the items could not be attached.", @"Title of alert indicating error during 'Attach Files...' when user tries to attach (insert) multiple files and some fail.");
+		    error = [NSError errorWithDomain:TextEditErrorDomain code:TextEditAttachFilesFailure userInfo:[NSDictionary dictionaryWithObjectsAndKeys:description, NSLocalizedDescriptionKey, NSLocalizedString(@"The files may be unreadable, or the volume they are on may be inaccessible. Please check in Finder.", @"Recommendation when 'Attach Files...' command fails"), NSLocalizedRecoverySuggestionErrorKey, nil]];
+		}
+		[[self window] presentError:error modalForWindow:[self window] delegate:nil didPresentSelector:NULL contextInfo:NULL];
+	    }
+	}
+     }];
+}
+
 
 /* Doesn't check to see if the prev value is the same --- Otherwise the first time doesn't work...
 attachmentFlag allows for optimizing some cases where we know we have no attachments, so we don't need to scan looking for them.
@@ -299,7 +365,9 @@ attachmentFlag allows for optimizing some cases where we know we have no attachm
 	if (!rich && attachmentFlag) [self removeAttachments];
 	NSRange range = NSMakeRange(0, [textStorage length]);
         if ([view shouldChangeTextInRange:range replacementString:nil]) {
-	    [textStorage setAttributes:textAttributes range: range];
+            [textStorage beginEditing];
+            [doc applyDefaultTextAttributes:rich];
+            [textStorage endEditing];
 	    [view didChangeText];
 	}
     }
@@ -449,9 +517,10 @@ attachmentFlag allows for optimizing some cases where we know we have no attachm
 	if (hasMultiplePages) {
 	    [self resizeWindowForViewSize:[[scrollView documentView] pageRectForPageNumber:0].size];
 	} else {
-	    NSInteger windowHeight = [[Preferences objectForKey:WindowHeight] integerValue];
-	    NSInteger windowWidth = [[Preferences objectForKey:WindowWidth] integerValue];
-	    NSFont *font = [Preferences objectForKey:[[self document] isRichText] ? RichTextFont : PlainTextFont];
+            NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+	    NSInteger windowHeight = [defaults integerForKey:WindowHeight];
+	    NSInteger windowWidth = [defaults integerForKey:WindowWidth];
+	    NSFont *font = [[self document] isRichText] ? [NSFont userFontOfSize:0.0] : [NSFont userFixedPitchFontOfSize:0.0];
             NSSize size;
             size.height = ceil([[self layoutManager] defaultLineHeightForFont:font] * windowHeight);
             size.width = [@"x" sizeWithAttributes:[NSDictionary dictionaryWithObject:font forKey:NSFontAttributeName]].width;
@@ -600,18 +669,34 @@ attachmentFlag allows for optimizing some cases where we know we have no attachm
         linkURL = [NSURL URLWithString:link relativeToURL:[[self document] fileURL]];
     }
     if (linkURL) {
-	// Special case: We want to open text types in TextEdit, as presumably that is what was desired
+        NSWorkspace *workspace = [NSWorkspace sharedWorkspace];
         if ([linkURL isFileURL]) {
-            NSString *path = [linkURL path];
-            if (path) {
-                NSString *extension = [path pathExtension];
-                if (extension && [[NSAttributedString textFileTypes] containsObject:extension]) {
-                    if ([[NSDocumentController sharedDocumentController] openDocumentWithContentsOfURL:linkURL display:YES error:nil] != nil) return YES;                    
+	    NSError *error;
+            if (![linkURL checkResourceIsReachableAndReturnError:&error]) {	// To be able to present an error panel, see if the file is reachable
+		[[self window] presentError:error modalForWindow:[self window] delegate:nil didPresentSelector:NULL contextInfo:NULL];
+		return YES;
+	    } else {
+                // Special case: We want to open text types in TextEdit, as presumably that is what was desired
+                NSString *typeIdentifier = nil;
+                if ([linkURL getResourceValue:&typeIdentifier forKey:NSURLTypeIdentifierKey error:NULL] && typeIdentifier) {
+                    BOOL openInTextEdit = NO;
+                    for (NSString *textTypeIdentifier in [NSAttributedString textTypes]) {
+                        if ([workspace type:typeIdentifier conformsToType:textTypeIdentifier]) {
+                            openInTextEdit = YES;
+                            break;
+                        }
+                    }
+                    if (openInTextEdit) {
+                        if ([[NSDocumentController sharedDocumentController] openDocumentWithContentsOfURL:linkURL display:YES error:NULL]) return YES;                    
+                    }
                 }
-                if ([[NSWorkspace sharedWorkspace] selectFile:path inFileViewerRootedAtPath:nil]) return YES;
+                // Other file URLs are displayed in Finder
+                [workspace activateFileViewerSelectingURLs:[NSArray arrayWithObject:linkURL]];
+                return YES;
             }
         } else {
-            if ([[NSWorkspace sharedWorkspace] openURL:linkURL]) return YES;
+            // Other URLs are simply opened
+            if ([workspace openURL:linkURL]) return YES;
         }
     }
     
@@ -691,11 +776,13 @@ attachmentFlag allows for optimizing some cases where we know we have no attachm
 @implementation DocumentWindowController(NSMenuValidation)
 
 - (BOOL)validateMenuItem:(NSMenuItem *)aCell {
-    if ([aCell action] == @selector(toggleRich:)) {
+    SEL action = [aCell action];
+    if (action == @selector(toggleRich:)) {
 	validateToggleItem(aCell, [[self document] isRichText], NSLocalizedString(@"&Make Plain Text", @"Menu item to make the current document plain text"), NSLocalizedString(@"&Make Rich Text", @"Menu item to make the current document rich text"));
         if ([[self document] isReadOnly]) return NO;
+    } else if (action == @selector(chooseAndAttachFiles:)) {
+        return [[self document] isRichText] && ![[self document] isReadOnly];
     }
-    
     return YES;
 }
 

@@ -1,6 +1,6 @@
 /*
         PrintPanelAccessoryController.m
-        Copyright (c) 2007 by Apple Computer, Inc., all rights reserved.
+        Copyright (c) 2007-2009 by Apple Computer, Inc., all rights reserved.
         Author: Ali Ozer
 	
 	PrintPanelAccessoryController is a subclass of NSViewController demonstrating how to add an accessory view to the print panel.
@@ -39,7 +39,7 @@
 */
 
 #import "PrintPanelAccessoryController.h"
-#import "Preferences.h"
+#import "TextEditDefaultsKeys.h"
 
 
 @implementation PrintPanelAccessoryController

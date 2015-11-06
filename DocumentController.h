@@ -5,22 +5,24 @@
 
 // NSDocumentController is subclassed to provide for modification of the open panel. Normally, there is no need to subclass the document controller.
 @interface DocumentController : NSDocumentController {
-    BOOL useCustomSettingsForOptions;	    // YES means that lastSelectedEncoding, lastSelectedIgnoreHTML, and lastSelectedIgnoreRich should be used instead of the default settings from Preferences
-    NSStringEncoding lastSelectedEncoding;
-    BOOL lastSelectedIgnoreHTML, lastSelectedIgnoreRich;
+    NSMutableDictionary *customOpenSettings;	    // Mapping of document URLs to encoding, ignore HTML, and ignore rich text settings that override the defaults from Preferences
+    NSMutableArray *deferredDocuments;
+    NSLock *transientDocumentLock;
+    NSLock *displayDocumentLock;
 }
 
 + (NSView *)encodingAccessory:(NSUInteger)encoding includeDefaultEntry:(BOOL)includeDefaultItem encodingPopUp:(NSPopUpButton **)popup checkBox:(NSButton **)button;
 
 - (Document *)openDocumentWithContentsOfPasteboard:(NSPasteboard *)pb display:(BOOL)display error:(NSError **)error;
 
-- (NSStringEncoding)lastSelectedEncoding;
-- (BOOL)lastSelectedIgnoreHTML;
-- (BOOL)lastSelectedIgnoreRich;
+- (NSStringEncoding)lastSelectedEncodingForURL:(NSURL *)url;
+- (BOOL)lastSelectedIgnoreHTMLForURL:(NSURL *)url;
+- (BOOL)lastSelectedIgnoreRichForURL:(NSURL *)url;
 
-- (NSInteger)runModalOpenPanel:(NSOpenPanel *)openPanel forTypes:(NSArray *)fileNameExtensionsAndHFSFileTypes;
+- (NSInteger)runModalOpenPanel:(NSOpenPanel *)openPanel forTypes:(NSArray *)types;
 
 - (Document *)transientDocumentToReplace;
-- (void)replaceTransientDocument:(Document *)transientDoc withDocument:(Document *)doc display:(BOOL)displayDocument;
+- (void)displayDocument:(NSDocument *)doc;
+- (void)replaceTransientDocument:(NSArray *)documents;
 
 @end

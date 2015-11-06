@@ -6,6 +6,6 @@
     id inspectedDocument;
 }
 
-- (void)toggleWindow:(id)sender;
+- (IBAction)toggleWindow:(id)sender;
 
 @end
